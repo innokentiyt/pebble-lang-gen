@@ -36,6 +36,7 @@ If you want to use a different font, place it in the `./font/` directory then mo
 - Noto Universal font -- https://github.com/satbyy/go-noto-universal
 - `fontgen.py` -- https://gist.github.com/medicalwei/c9fdcd9ec19b0c363ec1
 - `pbpack.py` and `stm32_crc.py` -- Couldn't locate source, but likely Pebble SDK
+- Kanji frequency list -- https://scriptin.github.io/kanji-frequency
 
 <a href="https://ko-fi.com/pyxzure" target="_blank">
   <img src="https://storage.ko-fi.com/cdn/kofi3.png?v=3" alt="Buy Me a Coffee" width="100" height="25"/>
