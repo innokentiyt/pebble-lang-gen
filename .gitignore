@@ -1,2 +1,4 @@
-build/
+build*/
+lang?*/
 utils/__pycache__/
+pbff/gothic/

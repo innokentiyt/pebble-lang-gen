@@ -1,6 +1,8 @@
 # Source: https://gist.github.com/medicalwei/c9fdcd9ec19b0c363ec1
 
 import argparse
+from enum import Enum
+from typing import Any
 import freetype
 import os
 import re
@@ -10,6 +12,8 @@ import itertools
 import json
 from math import ceil
 
+from utils.io import LinedFileReader
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 # import generate_c_byte_array
 
@@ -18,8 +22,8 @@ MAX_2_BYTES_CODEPOINT = 0xffff
 MAX_EXTENDED_CODEPOINT = 0x10ffff
 FONT_VERSION_1 = 1
 FONT_VERSION_2 = 2
-WILDCARD_CODEPOINT = 0x25AF  # White vertical rectangle
-ELLIPSIS_CODEPOINT = 0x2026
+WILDCARD_CODEPOINT = 0x25AF  # White vertical rectangle ▯
+ELLIPSIS_CODEPOINT = 0x2026  # …
 
 HASH_TABLE_SIZE = 255
 OFFSET_TABLE_MAX_SIZE = 128
@@ -45,17 +49,120 @@ def bits(x):
         x = x >> 1
     return data
 
+def load_pbff_file(path: str) -> dict[int, dict[str, Any]]:
+    """
+    Source: https://github.com/pebble-dev/renaissance/blob/master/lib/pbff.py
+    
+    Copyright (c) 2017 jneubrand, MIT License
+    """
+
+    glyphs = {}
+    with open(path, 'r') as fh:
+        f1 = LinedFileReader(fh)
+        glyphs = {}
+        while not f1.empty():
+            line = f1.next()
+
+            r = re.match(r'^\s*$/', line)
+            if r:
+                continue
+
+            r = re.match(r'^line-height (\d+)$', line)
+            if r:
+                # self.line_height = int(r.group(1))
+                continue
+
+            r = re.match(r'^version (\d+)$', line)
+            if r:
+                # self.version = int(r.group(1))
+                continue
+
+            r = re.match(r'^fallback (\d+)$', line)
+            if r:
+                # self.fallback_codepoint = int(r.group(1))
+                continue
+
+            r = re.match(r'^glyph (\d+)', line)
+            if r:
+                glyph_codepoint = int(r.group(1))
+                data = []
+                # 3rd capture group should accept negative numbers, such as -1
+                r = re.match(r'^(\s*)(-+|\.)\s*(-?\d+)$', f1.next())
+                if r:
+                    negativeLeft = len(r.group(1))
+                    advance = 0 if r.group(2) == '.' else len(r.group(2))
+                    top = int(r.group(3))
+                    r = re.match(r'^([ #]*)$', f1.peek())
+                    while r:
+                        f1.next()
+                        data += [[True if x == '#' else False
+                                for x in r.group(1)]]
+                        r = re.match(r'^([ #]*)$', f1.peek())
+                    first_enabled = None
+                    last_enabled = 0
+                    for bmpline in data:
+                        idx = 0
+                        for char in bmpline:
+                            if char and (first_enabled is None or idx < first_enabled):
+                                first_enabled = idx
+                            if char and idx > last_enabled:
+                                last_enabled = idx
+                            idx += 1
+                    for bmpline in data:
+                        while len(bmpline) <= last_enabled:
+                            bmpline += [False]
+                    data = [x[first_enabled:] for x in data]
+                    if first_enabled is None:
+                        left = 0
+                        width = 0
+                        height = 0
+                    else:
+                        left = first_enabled - negativeLeft
+                        width = last_enabled - first_enabled + 1
+                        height = len(data)
+                    glyphs[glyph_codepoint] = {
+                        'top': top,
+                        'data': data,
+                        'left': left,
+                        'width': width,
+                        'height': height,
+                        'advance': advance
+                    }
+                else:
+                    print(f'glyph_codepoint {glyph_codepoint}')
+                    print(f'path {path}')
+                    raise Exception('Invalid data')
+        return glyphs
+
+
+class FontType(Enum):
+    TTF = 1
+    PBFF = 2
+    MERGED = 3
+
 
 class Font:
-    def __init__(self, ttf_path, height, max_glyphs, legacy=False):
+    def __init__(self,
+                 font_type: FontType,
+                 ttf_path: str,
+                 pbff_path: str,
+                 height: int,
+                 max_glyphs: int,
+                 legacy=False):
         self.version = FONT_VERSION_2
+        self.type = font_type
         self.ttf_path = ttf_path
+        self.pbff_path = pbff_path
         self.max_height = int(height)
         self.legacy = legacy
         if self.ttf_path != '':
             self.face = freetype.Face(self.ttf_path)
             self.face.set_pixel_sizes(0, self.max_height)
             self.name = self.face.family_name + b'_' + self.face.style_name
+        if self.pbff_path != '':
+            self.pbff_glyphs: dict[int, dict[str, Any]] = load_pbff_file(pbff_path)
+            self.pbff_glyphs_list = list(self.pbff_glyphs.items())
+            self.pbff_glyphs_list_cursor_index = 0
         self.wildcard_codepoint = WILDCARD_CODEPOINT
         self.number_of_glyphs = 0
         self.table_size = HASH_TABLE_SIZE
@@ -95,8 +202,58 @@ class Font:
 
     def is_supported_glyph(self, codepoint):
         return (self.face.get_char_index(codepoint) > 0 or (codepoint == self.wildcard_codepoint))
+    
+    def get_first_char(self) -> tuple[int, int]:
+        if self.type == FontType.TTF:
+            (codepoint, gindex) = self.face.get_first_char()
+            return int(codepoint), gindex
+        else:
+            self.pbff_glyphs_list_cursor_index = 1
+            codepoint = self.pbff_glyphs_list[self.pbff_glyphs_list_cursor_index][0]
+            gindex = 1
+            return codepoint, gindex
+        
+    def get_next_char(self, codepoint, gindex) -> tuple[int, int]:
+        if self.type == FontType.TTF:
+            (codepoint, gindex) = self.face.get_next_char(codepoint, gindex)
+            return int(codepoint), gindex
+        else:
+            self.pbff_glyphs_list_cursor_index += 1
+            try:
+                codepoint = self.pbff_glyphs_list[self.pbff_glyphs_list_cursor_index][0]
+            except IndexError:
+                self.pbff_glyphs_list_cursor_index = 0
+                return 0, 0
+            gindex = self.pbff_glyphs_list_cursor_index
+            return codepoint, gindex
+    
+    def glyph_bits_pbff(self, codepoint) -> bytes:
+        def get_bytes(bits):
+            while len(bits):
+                item = 0
+                for x in range(8):
+                    item <<= 1
+                    item += bits.pop(7 - x)
+                yield item
 
-    def glyph_bits(self, gindex):
+        glyph = self.pbff_glyphs[codepoint]
+        glyph_header = struct.pack('<BBbbb',
+                                   glyph['width'],
+                                   glyph['height'],
+                                   glyph['left'],
+                                   glyph['top'],
+                                   glyph['advance'])
+        bits = sum(glyph['data'], [])
+        assert len(bits) == glyph['width'] * glyph['height']
+        while (len(bits) % 32):
+            bits = bits + [False]
+        glyph_packed = []
+        for byte in get_bytes(bits):
+            glyph_packed.append(struct.pack('<B', byte))
+
+        return glyph_header + b''.join(glyph_packed)
+
+    def glyph_bits_ttf(self, gindex):
         flags = (freetype.FT_LOAD_RENDER if self.legacy else
                  freetype.FT_LOAD_RENDER | freetype.FT_LOAD_MONOCHROME | freetype.FT_LOAD_TARGET_MONO)
         self.face.load_glyph(gindex, flags)
@@ -168,82 +325,6 @@ class Font:
                            self.table_size,
                            self.codepoint_bytes)
 
-    def build_tables(self):
-        def build_hash_table(bucket_sizes):
-            acc = 0
-            for i in range(self.table_size):
-                bucket_size = bucket_sizes[i]
-                self.hash_table[i] = struct.pack('<BBH', i, bucket_size, acc)
-                acc += bucket_size * (OFFSET_SIZE_BYTES + self.codepoint_bytes)
-
-        def build_offset_tables(glyph_entries):
-            offset_table_format = '<LL' if self.codepoint_bytes == 4 else '<HL'
-            bucket_sizes = [0] * self.table_size
-            for entry in glyph_entries:
-                codepoint, offset = entry
-                glyph_hash = hasher(codepoint, self.table_size)
-                self.offset_tables[glyph_hash].append(struct.pack(offset_table_format, codepoint, offset))
-                bucket_sizes[glyph_hash] += 1
-                if bucket_sizes[glyph_hash] > OFFSET_TABLE_MAX_SIZE:
-                    print(f"error: {bucket_sizes[glyph_hash]} > 127")
-            return bucket_sizes
-
-        def add_glyph(codepoint, next_offset, gindex, glyph_indices_lookup):
-            offset = next_offset
-            if gindex not in glyph_indices_lookup:
-                glyph_bits = self.glyph_bits(gindex)
-                glyph_indices_lookup[gindex] = offset
-                self.glyph_table.append(glyph_bits)
-                next_offset += len(glyph_bits)
-            else:
-                offset = glyph_indices_lookup[gindex]
-
-            if codepoint > MAX_2_BYTES_CODEPOINT:
-                self.codepoint_bytes = 4
-
-            self.number_of_glyphs += 1
-            return offset, next_offset, glyph_indices_lookup
-
-        def codepoint_is_in_subset(codepoint):
-            if codepoint not in (WILDCARD_CODEPOINT, ELLIPSIS_CODEPOINT):
-                if self.regex is not None:
-                    if self.regex.match(chr(codepoint)) is None:
-                        return False
-                if codepoint not in self.codepoints:
-                    return False
-            return True
-
-        glyph_entries = []
-        self.glyph_table.append(struct.pack('<I', 0))
-        self.number_of_glyphs = 0
-        glyph_indices_lookup = dict()
-        codepoint, gindex = self.face.get_first_char()
-
-        offset, next_offset, glyph_indices_lookup = add_glyph(WILDCARD_CODEPOINT, 4, 0, glyph_indices_lookup)
-        glyph_entries.append((WILDCARD_CODEPOINT, offset))
-
-        next_offset = 4 + len(self.glyph_table[-1])
-
-        while gindex:
-            if self.number_of_glyphs > self.max_glyphs:
-                break
-
-            if codepoint == WILDCARD_CODEPOINT:
-                raise Exception('Wildcard codepoint is used for something else in this font')
-
-            if gindex == 0:
-                raise Exception('0 index is reused by a non wildcard glyph')
-
-            if codepoint_is_in_subset(codepoint):
-                offset, next_offset, glyph_indices_lookup = add_glyph(codepoint, next_offset, gindex, glyph_indices_lookup)
-                glyph_entries.append((codepoint, offset))
-
-            codepoint, gindex = self.face.get_next_char(codepoint, gindex)
-
-        sorted_entries = sorted(glyph_entries, key=lambda entry: entry[0])
-        hash_bucket_sizes = build_offset_tables(sorted_entries)
-        build_hash_table(hash_bucket_sizes)
-
     def bitstring(self):
         btstr = self.fontinfo_bits()
         btstr += b''.join(self.hash_table)
@@ -251,121 +332,3 @@ class Font:
             btstr += b''.join(table)
         btstr += b''.join(self.glyph_table)
         return btstr
-
-    # def convert_to_h(self):
-    #     to_file = os.path.splitext(self.ttf_path)[0] + '.h'
-    #     with open(to_file, 'wb') as f:
-    #         f.write(b"#pragma once\n\n")
-    #         f.write(b"#include <stdint.h>\n\n")
-    #         f.write(b"// TODO: Load font from flash...\n\n")
-    #         self.build_tables()
-    #         bytes_ = self.bitstring()
-    #         # generate_c_byte_array.write expects file object and bytes string
-    #         generate_c_byte_array.write(f, bytes_, self.name)
-    #     return to_file
-    def convert_to_h(self):
-        to_file = os.path.splitext(self.ttf_path)[0] + '.h'
-        with open(to_file, 'wb') as f:
-            f.write(b"#pragma once\n\n")
-            f.write(b"#include <stdint.h>\n\n")
-            f.write(b"// TODO: Load font from flash...\n\n")
-            f.write(b"static const uint8_t %b[] = {\n\t" % self.name.encode('utf-8'))
-            self.build_tables()
-            bytes_ = self.bitstring()
-            for index, byte in enumerate(bytes_):
-                if index != 0 and index % 16 == 0:
-                    f.write(b"/* bytes %d - %d */\n\t" % (index-16, index))
-                f.write(b"0x%02x, " % byte)
-            f.write(b"\n};\n")
-        return to_file
-    
-    def convert_to_pfo(self, pfo_path=None):
-        to_file = pfo_path if pfo_path else (os.path.splitext(self.ttf_path)[0] + '.pfo')
-        with open(to_file, 'wb') as f:
-            self.build_tables()
-            f.write(self.bitstring())
-        return to_file
-
-
-def cmd_pfo(args):
-    max_glyphs = MAX_GLYPHS_EXTENDED if args.extended else MAX_GLYPHS
-    f = Font(args.input_ttf, args.height, max_glyphs, args.legacy)
-    if args.tracking:
-        f.set_tracking_adjust(args.tracking)
-    if args.heightoffset:
-        f.set_heightoffset(args.heightoffset)
-    if args.fauxbold:
-        f.set_fauxbold(args.fauxbold)
-    if args.filter:
-        f.set_regex_filter(args.filter)
-    if args.list:
-        f.set_codepoint_list(args.list)
-    f.convert_to_pfo(args.output_pfo)
-
-
-def cmd_header(args):
-    f = Font(args.input_ttf, args.height, MAX_GLYPHS, args.legacy)
-    if args.filter:
-        f.set_regex_filter(args.filter)
-    f.convert_to_h()
-
-
-def process_all_fonts():
-    font_directory = "ttf"
-    font_paths = []
-    for _, _, filenames in os.walk(font_directory):
-        for filename in filenames:
-            if os.path.splitext(filename)[1] == '.ttf':
-                font_paths.append(os.path.join(font_directory, filename))
-
-    header_paths = []
-    for font_path in font_paths:
-        f = Font(font_path, 14, MAX_GLYPHS)
-        print(f"Rendering {f.name}...")
-        f.convert_to_pfo()
-        to_file = f.convert_to_h()
-        header_paths.append(os.path.basename(to_file))
-
-    with open(os.path.join(font_directory, 'fonts.h'), 'w') as f:
-        f.write('#pragma once\n')
-        for h in header_paths:
-            f.write(f'#include "{h}"\n')
-
-
-def process_cmd_line_args():
-    parser = argparse.ArgumentParser(description="Generate pebble-usable fonts from ttf files")
-    subparsers = parser.add_subparsers(help="commands", dest='which')
-
-    pbi_parser = subparsers.add_parser('pfo', help="make a .pfo (pebble font) file")
-    pbi_parser.add_argument('--extended', action='store_true', help="Whether or not to store > 256 glyphs")
-    pbi_parser.add_argument('height', metavar='HEIGHT', type=int, help="Height at which to render the font")
-    pbi_parser.add_argument('--tracking', type=int, help="Optional tracking adjustment of the font's horizontal advance")
-    pbi_parser.add_argument('--filter', help="Regex to match the characters that should be included in the output")
-    pbi_parser.add_argument('--list', help="json list of characters to include")
-    pbi_parser.add_argument('--legacy', action='store_true', help="use legacy rasterizer (non-mono) to preserve font dimensions")
-    pbi_parser.add_argument('--fauxbold', action='store_true', help="generate faux bold font")
-    pbi_parser.add_argument('--heightoffset', type=int, help="height offset")
-    pbi_parser.add_argument('input_ttf', metavar='INPUT_TTF', help="The ttf to process")
-    pbi_parser.add_argument('output_pfo', metavar='OUTPUT_PFO', help="The pfo output file")
-    pbi_parser.set_defaults(func=cmd_pfo)
-
-    pbh_parser = subparsers.add_parser('header', help="make a .h (pebble fallback font) file")
-    pbh_parser.add_argument('height', metavar='HEIGHT', type=int, help="Height at which to render the font")
-    pbh_parser.add_argument('input_ttf', metavar='INPUT_TTF', help="The ttf to process")
-    pbh_parser.add_argument('output_header', metavar='OUTPUT_HEADER', help="The .h output file")
-    pbh_parser.add_argument('--filter', help="Regex to match the characters that should be included in the output")
-    pbh_parser.set_defaults(func=cmd_header)
-
-    args = parser.parse_args()
-    args.func(args)
-
-
-def main():
-    if len(sys.argv) < 2:
-        process_all_fonts()
-    else:
-        process_cmd_line_args()
-
-
-if __name__ == "__main__":
-    main()
