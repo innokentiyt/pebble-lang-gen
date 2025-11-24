@@ -209,7 +209,10 @@ class Font:
             return int(codepoint), gindex
         else:
             self.pbff_glyphs_list_cursor_index = 1
-            codepoint = self.pbff_glyphs_list[self.pbff_glyphs_list_cursor_index][0]
+            try:
+                codepoint = self.pbff_glyphs_list[self.pbff_glyphs_list_cursor_index][0]
+            except IndexError:
+                return 0, 0
             gindex = 1
             return codepoint, gindex
         
@@ -244,7 +247,11 @@ class Font:
                                    glyph['top'],
                                    glyph['advance'])
         bits = sum(glyph['data'], [])
-        assert len(bits) == glyph['width'] * glyph['height']
+        try:
+            assert len(bits) == glyph['width'] * glyph['height']
+        except AssertionError as ae:
+            print(f'codepoint {codepoint} in {self.pbff_path} has wrong number of bits or dimensions, check Space paddings in it')
+            raise ae
         while (len(bits) % 32):
             bits = bits + [False]
         glyph_packed = []
